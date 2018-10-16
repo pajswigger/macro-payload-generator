@@ -1,8 +1,6 @@
 package burp
 
-import org.json.JSONArray
-import org.json.JSONObject
-import org.json.JSONTokener
+import com.google.gson.Gson
 import java.awt.event.ActionEvent
 import java.awt.event.ActionListener
 import java.net.URL
@@ -33,120 +31,83 @@ class BurpExtender: IBurpExtender, IExtensionStateListener {
 
 
 class SyncFactories(): ActionListener {
-
     override fun actionPerformed(e: ActionEvent?) {
-        val registeredFactories = mutableMapOf<String, IIntruderPayloadGeneratorFactory>()
-        for(factory in BurpExtender.callbacks.intruderPayloadGeneratorFactories) {
-            registeredFactories[(factory as IntruderPayloadGeneratorFactory).macroName] = factory
+        val registeredFactories = BurpExtender.callbacks.intruderPayloadGeneratorFactories.map { (it as IntruderPayloadGeneratorFactory).macroName to it }.toMap().toMutableMap()
+        val macros = getMacros().filter{ it.items.size == 1 && it.items[0].custom_parameters.size == 1 }.map{ it.description }
+        macros.filter{ registeredFactories.remove(it) == null }.forEach{
+            BurpExtender.callbacks.registerIntruderPayloadGeneratorFactory(IntruderPayloadGeneratorFactory(it))
         }
-        for(macro in listMacros()) {
-            if(registeredFactories.remove(macro) == null) {
-                BurpExtender.callbacks.registerIntruderPayloadGeneratorFactory(IntruderPayloadGeneratorFactory(macro))
-            }
-        }
-        for(factory in registeredFactories.values) {
-            BurpExtender.callbacks.removeIntruderPayloadGeneratorFactory(factory)
-        }
-    }
-
-    fun listMacros(): List<String> {
-        val macros = getMacrosJSON()
-        val rc = mutableListOf<String>()
-        for(i in 0 until macros.length()) {
-            val macro = macros.getJSONObject(i)
-            val items = macro.getJSONArray("items")
-            if(items.length() != 1) {
-                continue
-            }
-            val customParameters = items.getJSONObject(0).getJSONArray("custom_parameters")
-            if(customParameters.length() != 1) {
-                continue
-            }
-            rc.add(macros.getJSONObject(i).getString("description"))
-        }
-        return rc
+        registeredFactories.values.forEach { BurpExtender.callbacks.removeIntruderPayloadGeneratorFactory(it) }
     }
 }
 
 
-fun getMacrosJSON(): JSONArray {
+fun getMacros(): List<Macro> {
     val configString = BurpExtender.callbacks.saveConfigAsJson("project_options.sessions.macros.macros")
-    val root = JSONObject(JSONTokener(configString))
-    return root.getJSONObject("project_options")
-            .getJSONObject("sessions")
-            .getJSONObject("macros")
-            .getJSONArray("macros")
+    try {
+        val root = Gson().fromJson(configString, Root::class.java)
+        return root.project_options.sessions.macros.macros
+    }
+    catch(ex: Exception) {
+        BurpExtender.callbacks.printError(ex.toString())
+        throw ex
+    }
 }
 
 
 class IntruderPayloadGeneratorFactory(val macroName: String) : IIntruderPayloadGeneratorFactory {
-    override val generatorName = "Run macro: " + macroName
+    override val generatorName = "Run macro: $macroName"
     override fun createNewInstance(attack: IIntruderAttack) = IntruderPayloadGenerator(macroName)
 }
 
 
 class IntruderPayloadGenerator(val macroName: String): IIntruderPayloadGenerator {
-    val macro = getMacro(macroName)
-    val item = macro.getJSONArray("items").getJSONObject(0)
-    val request = item.getString("request").toByteArray(Charsets.ISO_8859_1)
-    val url = URL(item.getString("url"))
-    val httpService = BurpExtender.callbacks.helpers.buildHttpService(url.host, url.port, url.protocol)
-    val customParameter = item.getJSONArray("custom_parameters").getJSONObject(0)
+    val item = getMacros().filter{ it.description == macroName }[0].items[0]
+    val request = item.request.toByteArray(Charsets.ISO_8859_1)
+    val httpService = with(URL(item.url)) { BurpExtender.callbacks.helpers.buildHttpService(host, port, protocol) }
 
+    override fun hasMorePayloads() = true
+    override fun reset() {}
     override fun getNextPayload(baseValue: ByteArray): ByteArray {
         val response = BurpExtender.callbacks.makeHttpRequest(httpService, request)
-        return extractCustomParameter(String(response.response, Charsets.ISO_8859_1)).toByteArray(Charsets.ISO_8859_1)
+        return extractCustomParameter(String(response.response, Charsets.ISO_8859_1), item.custom_parameters[0]).toByteArray(Charsets.ISO_8859_1)
     }
 
-    fun extractCustomParameter(response: String): String {
-        val caseSensitive = customParameter.getBoolean("case_sensitive")
+    fun extractCustomParameter(response: String, parameter: CustomParameter): String {
+        val caseSensitive = parameter.case_sensitive
         var value = ""
-        if(customParameter.getString("extract_mode") == "define_start_and_end") {
+        if(parameter.extract_mode == "define_start_and_end") {
             var startOffset: Int
-            if(customParameter.getString("start_at_mode") == "after_expression") {
-                val expression = customParameter.getString("start_after_expression")
+            if(parameter.start_at_mode == "after_expression") {
+                val expression = parameter.start_after_expression
                 startOffset = response.indexOf(expression, 0, caseSensitive) + expression.length
             }
             else {
-                startOffset = customParameter.getInt("start_af_offset")
+                startOffset = parameter.start_af_offset
             }
 
             var length: Int
-            if(customParameter.getString("end_mode") == "at_delimiter") {
-                val expression = customParameter.getString("end_at_delimiter")
+            if(parameter.end_mode == "at_delimiter") {
+                val expression = parameter.end_at_delimiter
                 length = response.indexOf(expression, startOffset, caseSensitive) - startOffset
             }
             else {
-                length = customParameter.getInt("end_at_fixed_length")
+                length = parameter.end_at_fixed_length
             }
 
             value = response.substring(startOffset, startOffset + length)
         }
         else {
-            val pattern = Pattern.compile(customParameter.getString("regular_expression"), if (!caseSensitive) { Pattern.CASE_INSENSITIVE } else { 0 } )
+            val pattern = Pattern.compile(parameter.regular_expression, if (!caseSensitive) { Pattern.CASE_INSENSITIVE } else { 0 } )
             with(pattern.matcher(response)) {
                 find()
                 value = group(1)
             }
         }
 
-        if(customParameter.getBoolean("url_encoded")) {
+        if(parameter.url_encoded) {
             value = URLDecoder.decode(value, "ISO_8859_1")
         }
         return value
-    }
-
-    override fun hasMorePayloads() = true
-    override fun reset() {}
-
-    fun getMacro(macroName: String): JSONObject {
-        val macros = getMacrosJSON()
-        for(i in 0 until macros.length()) {
-            val jsonObject = macros.getJSONObject(i)
-            if(jsonObject.getString("description") == macroName) {
-                return jsonObject
-            }
-        }
-        throw IllegalArgumentException(macroName)
     }
 }
